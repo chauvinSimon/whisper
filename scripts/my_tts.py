@@ -1,12 +1,13 @@
 import argparse
 from pathlib import Path
-import threading
-import queue
-import numpy as np
+
 import whisper
 import sounddevice as sd
+import numpy as np
 import soundfile as sf
-import subprocess
+import pyperclip
+import time
+import threading
 
 # Create a temporary file
 temp_audio_file_path = Path(__file__).parent / "temp.mp3"
@@ -19,133 +20,80 @@ def file_dump(data, file_path: Path):
 
 
 def record_audio(
-        max_duration=30,
-        sample_rate=44100  # Standard audio sampling rate
-) -> Path:
+        max_duration=30,  # Maximum recording duration (seconds) set by whisper
+        samplerate=44100,  # Sample rate (samples/second)
+        channels=1
+):
     print("Press `Enter` to START recording...")
-    input()
+    input()  # Wait for user to press Enter to start recording
+    print(f"Recording... Press `Enter` to STOP early (Max {max_duration} seconds).")
 
-    print(f"Recording (max {max_duration} seconds)... Press `Enter` to STOP early.")
+    recording = []  # List to store recorded audio chunks
+    start_time = time.time()  # Record start time
+    stop_event = threading.Event()  # Event to signal stopping the recording
 
-    # Create a queue to communicate between threads
-    audio_queue = queue.Queue()
-    stop_event = threading.Event()
+    # Function to listen for Enter key in a separate thread
+    def wait_for_stop():
+        input()  # Wait for user input (Enter key)
+        stop_event.set()  # Signal to stop recording
 
-    def audio_callback(indata, frames, time, status):
-        if status:
+    stop_thread = threading.Thread(target=wait_for_stop, daemon=True)  # Run input listener in background
+    stop_thread.start()
+
+    # Callback function for the audio stream
+    def callback(indata, frames, stream_time, status):
+        if status:  # Print any stream errors
             print(status)
-        audio_queue.put(indata.copy())
+        recording.append(indata.copy())  # Store incoming audio data
 
-    def record_thread():
-        with sd.InputStream(callback=audio_callback,
-                            channels=1,
-                            samplerate=sample_rate):
-            stop_event.wait()
+    # Start audio recording
+    with sd.InputStream(samplerate=samplerate, channels=channels, callback=callback):
+        while time.time() - start_time < max_duration:  # Continue recording until max duration
+            if stop_event.is_set():  # Stop if Enter key was pressed
+                break
+            time.sleep(0.1)  # Sleep briefly to prevent CPU overuse
 
-    # Collect audio data
-    audio_data = []
-
-    # Start recording thread
-    record_thread = threading.Thread(target=record_thread)
-    record_thread.start()
-
-    # Wait for user to press Enter (stop recording)
-    input()
-    stop_event.set()
-    record_thread.join()
-
-    # Collect all audio from the queue
-    while not audio_queue.empty():
-        audio_data.append(audio_queue.get())
-
-    # Convert to numpy array if not empty
-    if audio_data:
-        recording = np.concatenate(audio_data, axis=0)
-    else:
-        print("No audio recorded.")
-        return None
+    # Combine recorded chunks into a single array
+    audio_data = np.concatenate(recording, axis=0)
 
     # Save recording
-    sf.write(temp_audio_file_path, recording, sample_rate)
+    sf.write(temp_audio_file_path, audio_data, samplerate)
     print(f"Recording saved to {temp_audio_file_path}")
-
     return temp_audio_file_path
 
 
-def copy_to_clipboard(text: str):
-    # todo: try with pyperclip?
-    try:
-        # Try xclip first
-        subprocess.run(['xclip', '-selection', 'clipboard'], input=text, text=True, check=True)
-        print("Copied to clipboard using xclip")
-    except FileNotFoundError:
-        try:
-            # Try xsel as a backup
-            subprocess.run(['xsel', '-b', '-i'], input=text, text=True, check=True)
-            print("Copied to clipboard using xsel")
-        except FileNotFoundError:
-            print("Could not copy to clipboard. Please install xclip or xsel.")
-
-
-def transcribe_and_copy(model):
-    # Record audio
-    audio_file_path = record_audio()
-
-    if audio_file_path is None:
-        print("Recording failed. Skipping transcription.")
-        return None
-
-    # Transcribe
-    result = model.transcribe(str(audio_file_path))
-    transcription = result["text"]
-
-    # Save transcription to a text file
-    file_dump(transcription, file_path=temp_txt_file_path)
-
-    # Copy to clipboard
-    copy_to_clipboard(transcription)
-
-    print(f"Transcription:\n{transcription}")
-    return transcription
+def transcribe_audio(model, filename):
+    result = model.transcribe(filename)  # Transcribe the audio file
+    text = result["text"]  # Extract transcribed text
+    print(f"Transcription:\n{text}")
+    return text
 
 
 def main():
-    # Set up argument parser
     parser = argparse.ArgumentParser(description='Continuous Audio Transcription Tool')
     parser.add_argument('-m', '--model',
                         type=str,
                         default='base',
                         choices=['tiny', 'base', 'small', 'medium', 'large', 'turbo'],
                         help='Whisper model size (default: base)')
-
-    # Parse arguments
     args = parser.parse_args()
 
     # Load the model once
     print(f"Loading Whisper {args.model} model...")
     model = whisper.load_model(args.model)
-
-    print("Model loaded.")
-
-    print("Transcription tool started. Press Ctrl+C to quit.")
+    print("Model loaded.\nTranscription tool started. Press Ctrl+C to quit.")
 
     try:
         while True:
-            transcribe_and_copy(model)
-
+            audio_file = record_audio()
+            transcription = transcribe_audio(model, audio_file)
+            file_dump(transcription, temp_txt_file_path)
+            pyperclip.copy(transcription)  # Copy transcription to clipboard
     except KeyboardInterrupt:
         print("\nProgram interrupted by user.")
-
     finally:
         print("Bye.")
 
 
-def example():
-    model = whisper.load_model("turbo")
-    result = model.transcribe(str(temp_audio_file_path))
-    print(result["text"])
-
-
 if __name__ == "__main__":
-    # example()
     main()
